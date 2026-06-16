@@ -10,7 +10,7 @@ from typing import Optional, Dict, Any
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from core.database import SessionLocal, ScheduledTask, TaskRun
+from core.database import SessionLocal, ScheduledTask, TaskRun, TaskGroupMember, TaskGroupPending  # TaskGroupMember/TaskGroupPending back pipeline sources/state
 from core.constants import internal_api_base
 from src.auth_helpers import get_current_user
 from src.constants import DATA_DIR, EMAIL_URGENCY_CACHE_DIR
@@ -574,6 +574,47 @@ def setup_task_routes(task_scheduler) -> APIRouter:
             return {"notifications": []}
         notes = task_scheduler.pop_notifications(owner=user)
         return {"notifications": notes}
+
+    @router.get("/pipelines")
+    async def list_all_pipelines(request: Request):
+        """Return all pipelines for the current user in one call."""
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            memberships = db.query(TaskGroupMember).filter(TaskGroupMember.owner == user).all()
+            pending_rows = db.query(TaskGroupPending).join(
+                TaskGroupMember,
+                TaskGroupPending.aggregator_task_id == TaskGroupMember.aggregator_task_id,
+            ).filter(TaskGroupMember.owner == user).all()
+            pending_set = {(p.aggregator_task_id, p.member_task_id) for p in pending_rows}
+
+            by_output = {}
+            for m in memberships:
+                by_output.setdefault(m.aggregator_task_id, []).append(m)
+
+            pipelines = []
+            for output_id, sources in by_output.items():
+                output_task = db.query(ScheduledTask).filter(ScheduledTask.id == output_id).first()
+                completed = sum(1 for s in sources if (output_id, s.member_task_id) in pending_set)
+                pipelines.append({
+                    "output_task_id": output_id,
+                    "output_task_name": output_task.name if output_task else "(deleted)",
+                    "total_sources": len(sources),
+                    "completed_sources": completed,
+                    "sources": [
+                        {
+                            "source_task_id": s.member_task_id,
+                            "source_name": (
+                                db.query(ScheduledTask).filter(ScheduledTask.id == s.member_task_id).first() or ScheduledTask(name="(deleted)")
+                            ).name,
+                            "completed_this_cycle": (output_id, s.member_task_id) in pending_set,
+                        }
+                        for s in sources
+                    ],
+                })
+            return {"pipelines": pipelines}
+        finally:
+            db.close()
 
     @router.post("/{task_id}/clear-cache")
     async def clear_task_cache(request: Request, task_id: str):
@@ -1160,5 +1201,129 @@ def setup_task_routes(task_scheduler) -> APIRouter:
         except Exception as e:
             logger.error(f"parse_task failed: {e}")
             return {"success": False, "message": str(e)}
+
+    # ── Pipeline (fan-in) routes ──────────────────────────────────────────────
+
+    class PipelineSourceAdd(BaseModel):
+        source_task_id: str
+
+    def _assert_pipeline_ownership(db, output_id: str, source_id: str, user: Optional[str]):
+        """Raise 404/403/400 if either task is missing, not owned by user, or self-referencing."""
+        output_task = db.query(ScheduledTask).filter(ScheduledTask.id == output_id).first()
+        if not output_task:
+            raise HTTPException(404, "Pipeline output task not found")
+        if output_task.owner != user:
+            raise HTTPException(403, "Not your task")
+        source_task = db.query(ScheduledTask).filter(ScheduledTask.id == source_id).first()
+        if not source_task:
+            raise HTTPException(404, "Source task not found")
+        if source_task.owner != user:
+            raise HTTPException(403, "Cannot add another user's task to your pipeline")
+        if output_id == source_id:
+            raise HTTPException(400, "A task cannot be a source of its own pipeline")
+
+    @router.get("/{task_id}/pipeline")
+    async def get_pipeline_sources(task_id: str, request: Request):
+        """List all source tasks feeding into this pipeline output task."""
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            task = db.query(ScheduledTask).filter(ScheduledTask.id == task_id).first()
+            if not task or task.owner != user:
+                raise HTTPException(404, "Task not found")
+            sources = db.query(TaskGroupMember).filter(
+                TaskGroupMember.aggregator_task_id == task_id
+            ).all()
+            pending = db.query(TaskGroupPending).filter(
+                TaskGroupPending.aggregator_task_id == task_id
+            ).all()
+            pending_ids = {p.member_task_id for p in pending}
+            return {
+                "output_task_id": task_id,
+                "sources": [
+                    {
+                        "id": s.id,
+                        "source_task_id": s.member_task_id,
+                        "source_name": (
+                            db.query(ScheduledTask).filter(ScheduledTask.id == s.member_task_id).first() or ScheduledTask(name="(deleted)")
+                        ).name,
+                        "completed_this_cycle": s.member_task_id in pending_ids,
+                    }
+                    for s in sources
+                ],
+            }
+        finally:
+            db.close()
+
+    @router.post("/{task_id}/pipeline/sources")
+    async def add_pipeline_source(task_id: str, body: PipelineSourceAdd, request: Request):
+        """Add a source task to this pipeline output task."""
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            _assert_pipeline_ownership(db, task_id, body.source_task_id, user)
+            existing = db.query(TaskGroupMember).filter(
+                TaskGroupMember.aggregator_task_id == task_id,
+                TaskGroupMember.member_task_id == body.source_task_id,
+            ).first()
+            if existing:
+                raise HTTPException(409, "Task is already a source in this pipeline")
+            db.add(TaskGroupMember(
+                id=str(uuid.uuid4()),
+                aggregator_task_id=task_id,
+                member_task_id=body.source_task_id,
+                owner=user,
+            ))
+            db.commit()
+            return {"success": True, "source_task_id": body.source_task_id}
+        finally:
+            db.close()
+
+    @router.delete("/{task_id}/pipeline/sources/{source_id}")
+    async def remove_pipeline_source(task_id: str, source_id: str, request: Request):
+        """Remove a source task from this pipeline."""
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            task = db.query(ScheduledTask).filter(ScheduledTask.id == task_id).first()
+            if not task or task.owner != user:
+                raise HTTPException(404, "Task not found")
+            row = db.query(TaskGroupMember).filter(
+                TaskGroupMember.aggregator_task_id == task_id,
+                TaskGroupMember.member_task_id == source_id,
+            ).first()
+            if not row:
+                raise HTTPException(404, "Source not found in this pipeline")
+            db.delete(row)
+            pending = db.query(TaskGroupPending).filter(
+                TaskGroupPending.aggregator_task_id == task_id,
+                TaskGroupPending.member_task_id == source_id,
+            ).first()
+            if pending:
+                db.delete(pending)
+            db.commit()
+            return {"success": True}
+        finally:
+            db.close()
+
+    @router.delete("/{task_id}/pipeline")
+    async def dissolve_pipeline(task_id: str, request: Request):
+        """Remove all sources from this pipeline and clear pending results."""
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            task = db.query(ScheduledTask).filter(ScheduledTask.id == task_id).first()
+            if not task or task.owner != user:
+                raise HTTPException(404, "Task not found")
+            db.query(TaskGroupMember).filter(
+                TaskGroupMember.aggregator_task_id == task_id
+            ).delete()
+            db.query(TaskGroupPending).filter(
+                TaskGroupPending.aggregator_task_id == task_id
+            ).delete()
+            db.commit()
+            return {"success": True}
+        finally:
+            db.close()
 
     return router

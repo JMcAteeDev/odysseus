@@ -14,6 +14,10 @@ let _open = false;
 let _tasksCascadeNext = false;   // play the domino-in entrance on the next render
 let _tasks = [];
 let _tasksFetched = false;   // first-fetch sentinel — `false` → show loading row instead of "No tasks yet"
+let _pipelineSummary = { pipelines: [] };
+let _pipelineOutputIds = new Set();
+let _sourceOf = new Map();       // source_task_id → { output_task_id, output_task_name, pipeline }
+let _pipelineByOutput = new Map(); // output_task_id → pipeline object
 let _escHandler = null;
 let _viewingRuns = null; // task id when viewing run history
 let _clockInterval = null;
@@ -32,6 +36,7 @@ async function _fetchTasks() {
     _tasks = [];
   }
   _tasksFetched = true;
+  await _fetchPipelineSummary();
 }
 
 async function _runFirstOpenOnboarding() {
@@ -152,6 +157,134 @@ async function _fetchRuns(taskId, limit = 10) {
   return data.runs || [];
 }
 
+async function _fetchPipelineSummary() {
+  try {
+    const res = await fetch(`${API_BASE}/api/tasks/pipelines`, { credentials: 'same-origin' });
+    if (!res.ok) return;
+    _pipelineSummary = await res.json();
+  } catch (e) {
+    _pipelineSummary = { pipelines: [] };
+  }
+  _pipelineOutputIds = new Set();
+  _sourceOf = new Map();
+  _pipelineByOutput = new Map();
+  for (const p of (_pipelineSummary.pipelines || [])) {
+    _pipelineOutputIds.add(p.output_task_id);
+    _pipelineByOutput.set(p.output_task_id, p);
+    for (const s of (p.sources || [])) {
+      _sourceOf.set(s.source_task_id, { output_task_id: p.output_task_id, output_task_name: p.output_task_name, pipeline: p });
+    }
+  }
+}
+
+// ── Pipeline (fan-in) ────────────────────────────────────────────────────
+
+// Monochrome feather-style badge icons (no Unicode glyphs in UI — CONTRIBUTING).
+// Fork glyph marks a pipeline-output task; arrow marks a task that feeds one.
+const _PIPELINE_ICON_SVG = '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:3px"><circle cx="18" cy="18" r="2"/><circle cx="6" cy="6" r="2"/><circle cx="6" cy="18" r="2"/><path d="M6 8v8"/><path d="M8 6h3l7 9h-3"/></svg>';
+const _PIPELINE_ARROW_SVG = '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:3px"><path d="M5 12h14"/><path d="M12 5l7 7-7 7"/></svg>';
+
+async function _fetchPipeline(taskId) {
+  const res = await fetch(`${API_BASE}/api/tasks/${taskId}/pipeline`, { credentials: 'same-origin' });
+  if (!res.ok) return null;
+  return res.json();
+}
+
+async function _addPipelineSource(outputId, sourceTaskId) {
+  const res = await fetch(`${API_BASE}/api/tasks/${outputId}/pipeline/sources`, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source_task_id: sourceTaskId }),
+  });
+  return res.json();
+}
+
+async function _removePipelineSource(outputId, sourceTaskId) {
+  const res = await fetch(`${API_BASE}/api/tasks/${outputId}/pipeline/sources/${sourceTaskId}`, {
+    method: 'DELETE',
+    credentials: 'same-origin',
+  });
+  return res.json();
+}
+
+async function _renderPipelinePanel(taskId) {
+  const panel = document.getElementById('task-pipeline-panel');
+  if (!panel) return;
+
+  async function render() {
+    panel.innerHTML = '<span style="opacity:0.5;font-size:12px;">Loading…</span>';
+    const data = await _fetchPipeline(taskId);
+    if (!data) { panel.innerHTML = '<span style="opacity:0.5;font-size:12px;">Could not load pipeline.</span>'; return; }
+
+    const sources = data.sources || [];
+    const otherTasks = _tasks.filter(t => t.id !== taskId && !sources.find(s => s.source_task_id === t.id));
+
+    let html = '';
+
+    if (sources.length) {
+      html += '<div style="display:flex;flex-direction:column;gap:4px;margin-bottom:8px;">';
+      for (const s of sources) {
+        const dot = s.completed_this_cycle
+          ? '<span title="Completed this cycle" style="color:var(--green,#4caf50);font-size:10px;">●</span>'
+          : '<span title="Pending" style="opacity:0.35;font-size:10px;">●</span>';
+        html += `<div style="display:flex;align-items:center;justify-content:space-between;padding:5px 8px;background:var(--input-bg,rgba(255,255,255,0.04));border:1px solid var(--border);border-radius:5px;font-size:13px;">
+          <span>${dot} ${_esc(s.source_name)}</span>
+          <button data-sid="${_esc(s.source_task_id)}" class="task-pipeline-remove-btn" style="background:none;border:none;cursor:pointer;padding:0 2px;opacity:0.5;font-size:15px;line-height:1;" title="Remove">×</button>
+        </div>`;
+      }
+      html += '</div>';
+    } else {
+      html += '<p style="opacity:0.45;font-size:12px;margin:0 0 8px;">No sources yet — add tasks below to feed their results into this one.</p>';
+    }
+
+    if (otherTasks.length) {
+      html += `<div style="display:flex;gap:6px;align-items:center;">
+        <select id="task-pipeline-add-sel" class="task-form-input" style="flex:1;margin:0;">
+          <option value="">Add a source task…</option>
+          ${otherTasks.map(t => `<option value="${_esc(t.id)}">${_esc(t.name)}</option>`).join('')}
+        </select>
+        <button id="task-pipeline-add-btn" class="memory-toolbar-btn active" style="white-space:nowrap;">Add</button>
+      </div>`;
+    } else {
+      html += '<p style="opacity:0.4;font-size:12px;margin:0;">All other tasks are already sources in this pipeline.</p>';
+    }
+
+    panel.innerHTML = html;
+
+    panel.querySelectorAll('.task-pipeline-remove-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        await _removePipelineSource(taskId, btn.dataset.sid);
+        await _fetchPipelineSummary();
+        render();
+      });
+    });
+
+    const addBtn = document.getElementById('task-pipeline-add-btn');
+    if (addBtn) {
+      addBtn.addEventListener('click', async () => {
+        const sel = document.getElementById('task-pipeline-add-sel');
+        const sid = sel?.value;
+        if (!sid) return;
+        addBtn.disabled = true;
+        const result = await _addPipelineSource(taskId, sid);
+        if (result.detail) {
+          addBtn.disabled = false;
+          alert(result.detail);
+          return;
+        }
+        await _fetchPipelineSummary();
+        render();
+      });
+    }
+  }
+
+  render();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 let _outputTargets = null;
 async function _fetchOutputTargets() {
   if (_outputTargets) return _outputTargets;
@@ -228,6 +361,7 @@ function _scheduleLabel(task) {
     return `Every ${n} ${evtName}${n > 1 ? 's' : ''}`;
   }
   if (tt === 'webhook') return 'Webhook';
+  if (tt === 'pipeline') return 'Pipeline output';
   const t = task.scheduled_time || '00:00';
   if (task.schedule === 'cron') return `Cron: ${task.cron_expression || '?'}`;
   if (task.schedule === 'once') {
@@ -688,7 +822,15 @@ function _renderList() {
     const builtinBadge = task.is_builtin
       ? `<span class="task-builtin-badge${task.is_modified ? ' modified' : ''}" title="${task.is_modified ? 'Built-in task — edited from its default' : 'Built-in task'}">built-in${task.is_modified ? ' · edited' : ''}</span>`
       : '';
-    titleRow.innerHTML = `${_taskIcon(task)}<span class="memory-item-title">${_esc(task.name)}</span>${_taskAiMark(task)}${builtinBadge}<span style="flex:1;"></span>${statusBadge}`;
+    const pipeline = _pipelineByOutput.get(task.id);
+    const aggBadge = pipeline
+      ? `<span class="task-pipeline-badge task-pipeline-output-badge" data-pipeline-output="${_esc(task.id)}" title="${pipeline.completed_sources}/${pipeline.total_sources} sources completed this cycle">${_PIPELINE_ICON_SVG}pipeline · ${pipeline.completed_sources}/${pipeline.total_sources}</span>`
+      : '';
+    const srcInfo = _sourceOf.get(task.id);
+    const memBadge = srcInfo
+      ? `<span class="task-pipeline-badge task-pipeline-source-badge" data-pipeline-output="${_esc(srcInfo.output_task_id)}" title="Feeds into: ${_esc(srcInfo.output_task_name)}">${_PIPELINE_ARROW_SVG}pipeline</span>`
+      : '';
+    titleRow.innerHTML = `${_taskIcon(task)}<span class="memory-item-title">${_esc(task.name)}</span>${_taskAiMark(task)}${builtinBadge}${aggBadge}${memBadge}<span style="flex:1;"></span>${statusBadge}`;
 
     // ... menu button (hover to show)
     const actionsWrap = document.createElement('div');
@@ -796,6 +938,22 @@ function _renderList() {
       }
       detail.appendChild(desc);
     }
+    // Pipeline source status block (pipeline output tasks only)
+    if (pipeline) {
+      const gblock = document.createElement('div');
+      gblock.style.cssText = 'margin-top:6px;padding:6px 8px;border:1px solid var(--border);border-radius:5px;font-size:11px;';
+      const done = pipeline.completed_sources, total = pipeline.total_sources;
+      gblock.innerHTML = `<div style="font-weight:600;margin-bottom:5px;opacity:0.7;">Pipeline sources (${done}/${total} completed this cycle)</div>` +
+        pipeline.sources.map(s => {
+          const dot = s.completed_this_cycle
+            ? `<span style="color:var(--green,#50fa7b);">●</span>`
+            : `<span style="opacity:0.3;">●</span>`;
+          const check = s.completed_this_cycle ? `<span style="color:var(--green,#50fa7b);margin-left:auto;">✓</span>` : `<span style="opacity:0.3;margin-left:auto;">·</span>`;
+          return `<div style="display:flex;align-items:center;gap:6px;padding:2px 0;">${dot} <span>${_esc(s.source_name)}</span>${check}</div>`;
+        }).join('');
+      detail.appendChild(gblock);
+    }
+
     content.appendChild(detail);
 
     // Select-mode checkbox (mirrors the library's .memory-select-cb).
@@ -820,6 +978,8 @@ function _renderList() {
     titleRow.addEventListener('click', (e) => {
       if (card._suppressNextClick) return;  // long-press just opened the menu
       if (e.target.closest('.memory-item-actions')) return;
+      const pipelineBadge = e.target.closest('[data-pipeline-output]');
+      if (pipelineBadge) { e.stopPropagation(); _switchTab('pipelines', pipelineBadge.dataset.pipelineOutput); return; }
       if (_taskSelectMode) {
         if (e.target.classList.contains('memory-select-cb')) return;
         const cb = titleRow.querySelector('.memory-select-cb');
@@ -941,6 +1101,7 @@ const _TASK_PRESETS = [
   { label: 'Action on schedule',    desc: 'Run tidy/cleanup on a timer',                  taskType: 'action',   triggerType: 'schedule' },
   { label: 'Action on event',       desc: 'Run tidy/cleanup every N sessions or messages', taskType: 'action', triggerType: 'event' },
   { label: 'Webhook triggered',     desc: 'Trigger via external HTTP call',               taskType: 'llm',      triggerType: 'webhook' },
+  { label: 'Pipeline output',       desc: 'Fires when all pipeline source tasks complete', taskType: 'llm',      triggerType: 'pipeline' },
 ];
 
 // Icon for each preset, keyed off task/trigger type (24x24 stroke SVG).
@@ -1035,6 +1196,7 @@ function _showForm(existing, initTaskType, initTriggerType) {
         <button class="task-toggle-btn ${curTriggerType === 'schedule' ? 'active' : ''}" data-val="schedule" style="position:relative;top:-4px;"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:4px;"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>Schedule</button>
         <button class="task-toggle-btn ${curTriggerType === 'event' ? 'active' : ''}" data-val="event" style="position:relative;top:-4px;"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:4px;"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>Event</button>
         <button class="task-toggle-btn ${curTriggerType === 'webhook' ? 'active' : ''}" data-val="webhook" style="position:relative;top:-4px;"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:4px;"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>Webhook</button>
+        <button class="task-toggle-btn ${curTriggerType === 'pipeline' ? 'active' : ''}" data-val="pipeline" style="position:relative;top:-4px;"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:4px;"><circle cx="18" cy="18" r="2"/><circle cx="6" cy="6" r="2"/><circle cx="6" cy="18" r="2"/><path d="M6 8v8"/><path d="M8 6h3l7 9h-3"/></svg>Pipeline</button>
       </div>
 
       <div id="task-form-trigger-opts"></div>
@@ -1053,6 +1215,11 @@ function _showForm(existing, initTaskType, initTriggerType) {
       <select id="task-form-chain" class="task-form-input">
         <option value="">None</option>
       </select>
+
+      ${existing?.id ? `
+      <label class="task-form-label">Pipeline sources <span style="opacity:0.5;font-weight:normal;font-size:10px;">— tasks that run first and feed their results into this one</span></label>
+      <div id="task-pipeline-panel" style="margin-bottom:10px;"></div>
+      ` : ''}
 
       <label class="task-form-label" style="display:flex;align-items:center;gap:8px;cursor:pointer;">
         <input type="checkbox" id="task-form-notif" ${existing && existing.notifications_enabled === false ? '' : 'checked'} style="margin:0;cursor:pointer;">
@@ -1292,6 +1459,12 @@ function _showForm(existing, initTaskType, initTriggerType) {
       } else {
         triggerOpts.innerHTML = '<div style="font-size:11px;opacity:0.5;margin-top:4px;">Webhook URL will be generated when the task is saved.</div>';
       }
+    } else if (triggerType === 'pipeline') {
+      triggerOpts.innerHTML = `
+        <div style="padding:8px 10px;background:rgba(124,158,248,.08);border:1px solid rgba(124,158,248,.2);border-radius:6px;font-size:11px;line-height:1.6;margin-top:4px;">
+          <strong>Pipeline output</strong> — this task fires automatically once all its source tasks complete successfully. No schedule needed.<br>
+          Add source tasks below under "Pipeline sources".
+        </div>`;
     }
   }
 
@@ -1379,6 +1552,9 @@ function _showForm(existing, initTaskType, initTriggerType) {
       chainSel.appendChild(opt);
     }
   }
+
+  // Populate pipeline panel (only for existing tasks)
+  if (existing?.id) _renderPipelinePanel(existing.id);
 
   // Cancel — return to the Tasks tab (keeps the active-tab highlight in sync)
   document.getElementById('task-form-cancel').addEventListener('click', () => {
@@ -1740,7 +1916,7 @@ function _syncPauseAllButton() {
 
 let _activeTab = 'tasks';
 
-function _switchTab(tab) {
+function _switchTab(tab, scrollToAgg) {
   _activeTab = tab;
   const modal = document.getElementById('tasks-modal');
   if (!modal) return;
@@ -1751,6 +1927,7 @@ function _switchTab(tab) {
   });
   if (tab === 'tasks') _renderMainView();
   else if (tab === 'activity') _renderActivityView();
+  else if (tab === 'pipelines') _renderPipelinesView(scrollToAgg);
   else if (tab === 'new') _showPresetPicker();
 }
 
@@ -2436,6 +2613,100 @@ async function _aiDraftTask(inputEl, btnEl) {
   }
 }
 
+// ---- Pipelines view ----
+
+async function _renderPipelinesView(scrollToAgg) {
+  const modal = document.getElementById('tasks-modal');
+  if (!modal) return;
+  const body = modal.querySelector('.modal-body');
+  if (!body) return;
+
+  await _fetchPipelineSummary();
+  const pipelines = _pipelineSummary.pipelines || [];
+
+  if (!pipelines.length) {
+    body.innerHTML = `
+      <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:10px;opacity:0.45;font-size:13px;text-align:center;padding:24px;">
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M6 9v6"/><path d="M9 6h3l6 9h-3"/></svg>
+        <div>No pipelines yet.</div>
+        <div style="font-size:11px;opacity:0.7;">Edit any task and add source tasks under "Pipeline sources" to create one.</div>
+      </div>`;
+    return;
+  }
+
+  body.innerHTML = '<div class="task-pipelines-list"></div>';
+  const list = body.querySelector('.task-pipelines-list');
+
+  for (const p of pipelines) {
+    const card = document.createElement('div');
+    card.className = 'task-pipeline-card';
+    card.dataset.outputId = p.output_task_id;
+    const done = p.completed_sources, total = p.total_sources;
+    const pct = total ? Math.round((done / total) * 100) : 0;
+    const outputTask = _tasks.find(t => t.id === p.output_task_id);
+
+    card.innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+        <span style="font-weight:600;font-size:13px;flex:1;">${_esc(p.output_task_name)}</span>
+        <span class="task-pipeline-badge task-pipeline-output-badge">${_PIPELINE_ICON_SVG}${done}/${total} done</span>
+        ${outputTask ? `<button class="memory-toolbar-btn task-pipeline-edit-btn" data-output-id="${_esc(p.output_task_id)}" style="font-size:10px;padding:2px 7px;">Edit</button>` : ''}
+      </div>
+      <div style="height:4px;background:var(--border);border-radius:2px;margin-bottom:10px;overflow:hidden;">
+        <div style="height:100%;width:${pct}%;background:var(--accent,#7c9ef8);border-radius:2px;transition:width .3s;"></div>
+      </div>
+      <div class="task-pipeline-sources-list">
+        ${p.sources.map(s => {
+          const dot = s.completed_this_cycle
+            ? `<span style="color:var(--green,#50fa7b);">●</span>`
+            : `<span style="opacity:0.3;">●</span>`;
+          const status = s.completed_this_cycle
+            ? `<span style="color:var(--green,#50fa7b);font-size:10px;">✓ done</span>`
+            : `<span style="opacity:0.35;font-size:10px;">· pending</span>`;
+          return `<div style="display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid var(--border);font-size:12px;">
+            ${dot}
+            <span style="flex:1;">${_esc(s.source_name)}</span>
+            ${status}
+            <button class="memory-toolbar-btn task-pipeline-run-source-btn" data-sid="${_esc(s.source_task_id)}" style="font-size:10px;padding:2px 7px;" ${s.completed_this_cycle ? 'title="Already ran this cycle"' : ''}>Run</button>
+          </div>`;
+        }).join('')}
+      </div>
+      <div style="display:flex;gap:6px;margin-top:8px;">
+        <button class="memory-toolbar-btn task-pipeline-run-all-btn active" data-output-id="${_esc(p.output_task_id)}" style="font-size:10px;">
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:4px;"><polygon points="5 3 19 12 5 21 5 3"/></svg>Run all sources
+        </button>
+      </div>`;
+
+    // Edit output task
+    card.querySelector('.task-pipeline-edit-btn')?.addEventListener('click', () => {
+      if (outputTask) _showForm(outputTask);
+    });
+
+    // Run individual source
+    card.querySelectorAll('.task-pipeline-run-source-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        await _runNow(btn.dataset.sid);
+        setTimeout(() => { _renderPipelinesView(); }, 1500);
+      });
+    });
+
+    // Run all sources
+    card.querySelector('.task-pipeline-run-all-btn')?.addEventListener('click', async (e) => {
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      for (const s of p.sources) await _runNow(s.source_task_id);
+      setTimeout(() => { _renderPipelinesView(); }, 1500);
+    });
+
+    list.appendChild(card);
+  }
+
+  if (scrollToAgg) {
+    const target = list.querySelector(`[data-output-id="${scrollToAgg}"]`);
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+}
+
 function _renderMainView() {
   const modal = document.getElementById('tasks-modal');
   if (!modal) return;
@@ -2535,6 +2806,10 @@ export function openTasks(focusId, opts) {
         <button class="memory-tab tasks-tab" data-tab="activity" role="tab" aria-selected="false">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
           Activity
+        </button>
+        <button class="memory-tab tasks-tab" data-tab="pipelines" role="tab" aria-selected="false">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px"><circle cx="18" cy="18" r="2"/><circle cx="6" cy="6" r="2"/><circle cx="6" cy="18" r="2"/><path d="M6 8v8"/><path d="M8 6h3l7 9h-3"/></svg>
+          Pipelines
         </button>
         <button class="memory-tab tasks-tab" data-tab="new" role="tab" aria-selected="false">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>

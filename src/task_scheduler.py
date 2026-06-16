@@ -633,6 +633,8 @@ class TaskScheduler:
                 for task in due:
                     if task.id in self._executing:
                         continue
+                    if (task.trigger_type or "schedule") == "pipeline":
+                        continue  # pipeline output tasks only fire via pipeline completion
                     self._executing.add(task.id)
                     to_dispatch.append(task.id)
             for task_id in to_dispatch:
@@ -640,7 +642,7 @@ class TaskScheduler:
         finally:
             db.close()
 
-    async def _execute_task(self, task_id: str, *, bypass_model_slot: bool = False, release_executing: bool = True):
+    async def _execute_task(self, task_id: str, *, bypass_model_slot: bool = False, release_executing: bool = True, pipeline_prompt_override: str | None = None):
         # Create the run record with status="queued" BEFORE waiting on the
         # semaphore so the UI can show that a manually-triggered task is in
         # line behind another. Once we acquire the slot, flip to "running"
@@ -668,11 +670,11 @@ class TaskScheduler:
 
         try:
             if bypass_model_slot or not self._task_needs_model_slot(task_id):
-                await self._execute_task_locked(task_id, run_id, release_executing=release_executing)
+                await self._execute_task_locked(task_id, run_id, release_executing=release_executing, pipeline_prompt_override=pipeline_prompt_override)
                 return
 
             async with self._run_semaphore:
-                await self._execute_task_locked(task_id, run_id, release_executing=release_executing)
+                await self._execute_task_locked(task_id, run_id, release_executing=release_executing, pipeline_prompt_override=pipeline_prompt_override)
         except asyncio.CancelledError:
             # If cancellation happens while queued behind the semaphore,
             # _execute_task_locked never runs and cannot update the Activity row.
@@ -686,7 +688,7 @@ class TaskScheduler:
                 async with self._executing_lock:
                     self._executing.discard(task_id)
 
-    async def _execute_task_locked(self, task_id: str, run_id: str, *, release_executing: bool = True):
+    async def _execute_task_locked(self, task_id: str, run_id: str, *, release_executing: bool = True, pipeline_prompt_override: str | None = None):
         from core.database import SessionLocal, ScheduledTask, TaskRun
 
         db = SessionLocal()
@@ -746,7 +748,7 @@ class TaskScheduler:
                     run.result = result
                 else:
                     # LLM task — use agent loop for tool access
-                    result = await self._execute_llm_task(task, db)
+                    result = await self._execute_llm_task(task, db, pipeline_prompt_override=pipeline_prompt_override)
                     run.status = "success"
                     run.result = result
                 # Record which model actually ran (resolved inside the executor).
@@ -878,6 +880,10 @@ class TaskScheduler:
                     asyncio.create_task(self._run_chained(chain_id))
                 else:
                     logger.warning(f"Skipping chain from '{task.name}': cycle detected")
+
+            # Pipeline fan-in — record this source's result; fire output task when all sources done
+            if run.status == "success":
+                asyncio.create_task(self._handle_pipeline_source_completion(task, run.result or ""))
 
         except Exception as exec_exc:
             logger.exception(f"Task {task_id} execution error")
@@ -1296,7 +1302,7 @@ class TaskScheduler:
             override_user_message=context,
         )
 
-    async def _execute_llm_task(self, task, db) -> str:
+    async def _execute_llm_task(self, task, db, pipeline_prompt_override: str | None = None) -> str:
         """Execute an LLM task with full tool access via the agent loop."""
         from core.database import Session as DbSession, ChatMessage, CrewMember
 
@@ -1401,6 +1407,28 @@ class TaskScheduler:
             except Exception:
                 pass
 
+        # When running as a group aggregator all member results are already
+        # injected into the prompt — there is nothing left to search for.
+        # Override the system prompt to prevent the model from web-searching
+        # and block search/fetch tools so it synthesizes directly.
+        _PIPELINE_OUTPUT_SEARCH_TOOLS = {
+            "web_search", "web_fetch", "search_chats", "search_web",
+            "brave_search", "tavily_search", "searxng_search",
+        }
+        if pipeline_prompt_override:
+            if not (crew and crew.personality):
+                system_prompt = (
+                    f"Current time: {time_str}\n\n"
+                    "You are a helpful assistant executing a scheduled task.\n"
+                    "All required information has already been collected and is provided below. "
+                    "Synthesize the provided data directly. "
+                    "Do NOT use web_search, web_fetch, or any search tools — "
+                    "every fact you need is already in the message."
+                )
+            if disabled_tools is None:
+                disabled_tools = set()
+            disabled_tools |= _PIPELINE_OUTPUT_SEARCH_TOOLS
+
         # RAG-select relevant tools for this prompt + always-available assistant tools.
         # Without this, all 40+ tools get sent and models hit their tool limit.
         relevant_tools = None
@@ -1422,13 +1450,14 @@ class TaskScheduler:
                 endpoint_url, model, task, session_id,
                 system_prompt=system_prompt, disabled_tools=disabled_tools,
                 relevant_tools=relevant_tools,
+                override_user_message=pipeline_prompt_override,
             )
         except Exception as e:
             logger.warning(f"Agent loop failed for task '{task.name}', falling back to simple call: {e}")
             from src.llm_core import llm_call_async
             messages = [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": task.prompt},
+                {"role": "user", "content": pipeline_prompt_override or task.prompt},
             ]
             result = await llm_call_async(url=endpoint_url, model=model, messages=messages, timeout=120)
 
@@ -1861,6 +1890,25 @@ class TaskScheduler:
         """Run a chained task. Acquires _executing membership the same way
         run_task_now does so an overlapping scheduler tick can't double-dispatch
         the same task while the chain run is in flight."""
+        # If the target is a pipeline output task, skip the chain entirely.
+        # The pipeline mechanism will fire it with all source results injected once
+        # every source completes. A bare chain would race ahead with no data.
+        from core.database import SessionLocal, TaskGroupMember
+        _db = SessionLocal()
+        try:
+            _is_pipeline_output = _db.query(TaskGroupMember).filter(
+                TaskGroupMember.aggregator_task_id == task_id
+            ).first() is not None
+        finally:
+            _db.close()
+        if _is_pipeline_output:
+            logger.info(
+                "Skipping chain to task %s — it is a pipeline output task and will be "
+                "fired by the pipeline mechanism once all sources complete.",
+                task_id,
+            )
+            return
+
         async with self._executing_lock:
             if task_id in self._executing:
                 return  # already in flight (manual trigger, scheduler tick, or another chain)
@@ -1883,6 +1931,82 @@ class TaskScheduler:
                 return False
             current = task.then_task_id
         return True  # too deep, treat as cycle
+
+    async def _handle_pipeline_source_completion(self, task, result: str):
+        """Record a source task's result and fire the pipeline output when all sources are done."""
+        from core.database import SessionLocal, TaskGroupMember, TaskGroupPending
+        db = SessionLocal()
+        try:
+            memberships = db.query(TaskGroupMember).filter(
+                TaskGroupMember.member_task_id == task.id
+            ).all()
+            for membership in memberships:
+                output_id = membership.aggregator_task_id
+                # Replace any stale result from a prior cycle
+                old = db.query(TaskGroupPending).filter(
+                    TaskGroupPending.aggregator_task_id == output_id,
+                    TaskGroupPending.member_task_id == task.id,
+                ).first()
+                if old:
+                    db.delete(old)
+                db.add(TaskGroupPending(
+                    id=str(uuid.uuid4()),
+                    aggregator_task_id=output_id,
+                    member_task_id=task.id,
+                    member_name=task.name,
+                    result=result,
+                    completed_at=_utcnow(),
+                ))
+                db.commit()
+
+                total = db.query(TaskGroupMember).filter(
+                    TaskGroupMember.aggregator_task_id == output_id
+                ).count()
+                pending_rows = db.query(TaskGroupPending).filter(
+                    TaskGroupPending.aggregator_task_id == output_id
+                ).all()
+
+                if len(pending_rows) >= total:
+                    source_results = [(row.member_name, row.result or "") for row in pending_rows]
+                    for row in pending_rows:
+                        db.delete(row)
+                    db.commit()
+                    logger.info(
+                        "Pipeline complete: all %s sources done, firing output task %s",
+                        total, output_id,
+                    )
+                    asyncio.create_task(self._run_pipeline_output(output_id, source_results))
+        except Exception:
+            logger.exception("_handle_pipeline_source_completion failed for task %s", task.id)
+        finally:
+            db.close()
+
+    async def _run_pipeline_output(self, output_id: str, source_results: list):
+        """Fire the pipeline output task with all source results injected into its prompt."""
+        async with self._executing_lock:
+            if output_id in self._executing:
+                logger.warning("Pipeline output task %s already in flight, skipping", output_id)
+                return
+            self._executing.add(output_id)
+
+        from core.database import SessionLocal, ScheduledTask
+        db = SessionLocal()
+        try:
+            output_task = db.query(ScheduledTask).filter(ScheduledTask.id == output_id).first()
+            original_prompt = (output_task.prompt or "").strip() if output_task else ""
+        finally:
+            db.close()
+
+        sections = "\n\n".join(
+            f"### {name}\n{result}" for name, result in source_results
+        )
+        override = (
+            f"The following summaries were collected from your pipeline source tasks:\n\n{sections}"
+        )
+        if original_prompt:
+            override += f"\n\nUsing all of the above, complete the following:\n{original_prompt}"
+
+        await self._execute_task(output_id, pipeline_prompt_override=override)
 
     def _resolve_defaults(self, db, owner):
         """Find the first available endpoint + model from an existing session."""

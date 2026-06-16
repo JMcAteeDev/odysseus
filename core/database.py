@@ -1712,6 +1712,46 @@ class Integration(TimestampMixin, Base):
     enabled = Column(Boolean, default=True)
 
 
+class TaskGroupMember(Base):
+    """Maps a member task to its aggregator task for fan-in chaining.
+
+    When every member task in a group completes successfully, the aggregator
+    task fires automatically with all member results injected into its prompt.
+    """
+    __tablename__ = "task_group_members"
+
+    id               = Column(String, primary_key=True, index=True)
+    aggregator_task_id = Column(String, ForeignKey("scheduled_tasks.id", ondelete="CASCADE"), nullable=False)
+    member_task_id   = Column(String, ForeignKey("scheduled_tasks.id", ondelete="CASCADE"), nullable=False)
+    owner            = Column(String, nullable=True)
+
+    aggregator_task = relationship("ScheduledTask", foreign_keys=[aggregator_task_id])
+    member_task     = relationship("ScheduledTask", foreign_keys=[member_task_id])
+
+    __table_args__ = (
+        Index('ix_task_group_members_aggregator', 'aggregator_task_id'),
+        Index('ix_task_group_members_member', 'member_task_id'),
+    )
+
+
+class TaskGroupPending(Base):
+    """Holds a completed member task's result until all siblings finish.
+
+    Cleared in bulk once the aggregator fires. One row per member per cycle —
+    upserted on each new run so stale results from previous cycles are replaced.
+    """
+    __tablename__ = "task_group_pending"
+
+    id                 = Column(String, primary_key=True, index=True)
+    aggregator_task_id = Column(String, ForeignKey("scheduled_tasks.id", ondelete="CASCADE"), nullable=False)
+    member_task_id     = Column(String, ForeignKey("scheduled_tasks.id", ondelete="CASCADE"), nullable=False)
+    member_name        = Column(String, nullable=False)
+    result             = Column(Text, nullable=True)
+    completed_at       = Column(DateTime, nullable=False, default=utcnow_naive)
+
+    __table_args__ = (
+        Index('ix_task_group_pending_aggregator', 'aggregator_task_id'),
+    )
 
 
 
@@ -1838,6 +1878,41 @@ def init_db():
     _migrate_encrypt_signatures()
     _migrate_encrypt_endpoint_keys()
     _migrate_backfill_task_folders()
+    _migrate_add_task_group_tables()
+
+
+def _migrate_add_task_group_tables():
+    """Add task_group_members and task_group_pending tables for fan-in chaining."""
+    try:
+        with engine.connect() as conn:
+            existing = [r[0] for r in conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))]
+            if "task_group_members" not in existing:
+                conn.execute(text("""
+                    CREATE TABLE task_group_members (
+                        id TEXT PRIMARY KEY,
+                        aggregator_task_id TEXT NOT NULL REFERENCES scheduled_tasks(id) ON DELETE CASCADE,
+                        member_task_id TEXT NOT NULL REFERENCES scheduled_tasks(id) ON DELETE CASCADE,
+                        owner TEXT
+                    )
+                """))
+                conn.execute(text("CREATE INDEX ix_task_group_members_aggregator ON task_group_members(aggregator_task_id)"))
+                conn.execute(text("CREATE INDEX ix_task_group_members_member ON task_group_members(member_task_id)"))
+            if "task_group_pending" not in existing:
+                conn.execute(text("""
+                    CREATE TABLE task_group_pending (
+                        id TEXT PRIMARY KEY,
+                        aggregator_task_id TEXT NOT NULL REFERENCES scheduled_tasks(id) ON DELETE CASCADE,
+                        member_task_id TEXT NOT NULL REFERENCES scheduled_tasks(id) ON DELETE CASCADE,
+                        member_name TEXT NOT NULL,
+                        result TEXT,
+                        completed_at DATETIME NOT NULL
+                    )
+                """))
+                conn.execute(text("CREATE INDEX ix_task_group_pending_aggregator ON task_group_pending(aggregator_task_id)"))
+            conn.commit()
+            logging.getLogger(__name__).info("Task group tables migration complete")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Task group tables migration failed: {e}")
 
 
 def _migrate_backfill_task_folders():
